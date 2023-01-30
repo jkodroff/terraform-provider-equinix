@@ -1,15 +1,16 @@
 package equinix
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"path"
 	"sort"
 	"strings"
 
+	metalv1 "github.com/equinix-labs/metal-go/metal/v1"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/structure"
-	"github.com/packethost/packngo"
 )
 
 func dataSourceMetalDevice() *schema.Resource {
@@ -202,7 +203,7 @@ func dataSourceMetalDevice() *schema.Resource {
 }
 
 func dataSourceMetalDeviceRead(d *schema.ResourceData, meta interface{}) error {
-	client := meta.(*Config).metal
+	client := meta.(*Config).metalgo
 
 	hostnameRaw, hostnameOK := d.GetOk("hostname")
 	projectIdRaw, projectIdOK := d.GetOk("project_id")
@@ -211,7 +212,8 @@ func dataSourceMetalDeviceRead(d *schema.ResourceData, meta interface{}) error {
 	if !deviceIdOK && !hostnameOK {
 		return fmt.Errorf("You must supply device_id or hostname")
 	}
-	var device *packngo.Device
+	var device *metalv1.Device
+
 	if hostnameOK {
 		if !projectIdOK {
 			return fmt.Errorf("If you lookup via hostname, you must supply project_id")
@@ -219,9 +221,7 @@ func dataSourceMetalDeviceRead(d *schema.ResourceData, meta interface{}) error {
 		hostname := hostnameRaw.(string)
 		projectId := projectIdRaw.(string)
 
-		ds, _, err := client.Devices.List(
-			projectId,
-			&packngo.ListOptions{Search: hostname, Includes: deviceCommonIncludes})
+		ds, _, err := client.DevicesApi.FindProjectDevices(context.Background(), projectId).Hostname(hostname).Include(deviceCommonIncludes).Execute()
 		if err != nil {
 			return err
 		}
@@ -233,26 +233,28 @@ func dataSourceMetalDeviceRead(d *schema.ResourceData, meta interface{}) error {
 	} else {
 		deviceId := deviceIdRaw.(string)
 		var err error
-		device, _, err = client.Devices.Get(deviceId, deviceReadOptions)
+		device, _, err = client.DevicesApi.FindDeviceById(context.Background(), deviceId).Include(deviceCommonIncludes).Execute()
 		if err != nil {
 			return err
 		}
 	}
 
 	d.Set("hostname", device.Hostname)
-	d.Set("project_id", device.Project.ID)
-	d.Set("device_id", device.ID)
+	d.Set("project_id", device.Project.Id)
+	d.Set("device_id", device.Id)
 	d.Set("plan", device.Plan.Slug)
 	d.Set("facility", device.Facility.Code)
 	if device.Metro != nil {
-		d.Set("metro", strings.ToLower(device.Metro.Code))
+		d.Set("metro", strings.ToLower(device.Metro.GetCode()))
 	}
-	d.Set("operating_system", device.OS.Slug)
+	d.Set("operating_system", device.OperatingSystem.Slug)
 	d.Set("state", device.State)
 	d.Set("billing_cycle", device.BillingCycle)
-	d.Set("ipxe_script_url", device.IPXEScriptURL)
-	d.Set("always_pxe", device.AlwaysPXE)
+	d.Set("ipxe_script_url", device.IpxeScriptUrl)
+	d.Set("always_pxe", device.AlwaysPxe)
 	d.Set("root_password", device.RootPassword)
+
+	// Device schema needs to be updated to define the `storage` field
 	if device.Storage != nil {
 		rawStorageBytes, err := json.Marshal(device.Storage)
 		if err != nil {
@@ -267,27 +269,30 @@ func dataSourceMetalDeviceRead(d *schema.ResourceData, meta interface{}) error {
 	}
 
 	if device.HardwareReservation != nil {
-		d.Set("hardware_reservation_id", device.HardwareReservation.ID)
+		d.Set("hardware_reservation_id", device.HardwareReservation.Id)
 	}
-	networkType := device.GetNetworkType()
+	networkType, err := getMetalGoNetworkType(device)
+	if err != nil {
+		return fmt.Errorf("[ERR] Error computing network type for device (%s): %s", d.Id(), err)
+	}
 
 	d.Set("network_type", networkType)
 
 	d.Set("tags", device.Tags)
 
 	keyIDs := []string{}
-	for _, k := range device.SSHKeys {
-		keyIDs = append(keyIDs, path.Base(k.URL))
+	for _, k := range device.SshKeys {
+		keyIDs = append(keyIDs, path.Base(k.Href))
 	}
 	d.Set("ssh_key_ids", keyIDs)
-	networkInfo := getNetworkInfo(device.Network)
+	networkInfo := getMetalGoNetworkInfo(device.IpAddresses)
 
 	sort.SliceStable(networkInfo.Networks, func(i, j int) bool {
-		famI := networkInfo.Networks[i]["family"].(int)
-		famJ := networkInfo.Networks[j]["family"].(int)
+		famI := networkInfo.Networks[i]["family"].(int32)
+		famJ := networkInfo.Networks[j]["family"].(int32)
 		pubI := networkInfo.Networks[i]["public"].(bool)
 		pubJ := networkInfo.Networks[j]["public"].(bool)
-		return getNetworkRank(famI, pubI) < getNetworkRank(famJ, pubJ)
+		return getNetworkRank(int(famI), pubI) < getNetworkRank(int(famJ), pubJ)
 	})
 
 	d.Set("network", networkInfo.Networks)
@@ -295,17 +300,17 @@ func dataSourceMetalDeviceRead(d *schema.ResourceData, meta interface{}) error {
 	d.Set("access_private_ipv4", networkInfo.PrivateIPv4)
 	d.Set("access_public_ipv6", networkInfo.PublicIPv6)
 
-	ports := getPorts(device.NetworkPorts)
+	ports := getMetalGoPorts(device.NetworkPorts)
 	d.Set("ports", ports)
 
-	d.SetId(device.ID)
+	d.SetId(*device.Id)
 	return nil
 }
 
-func findDeviceByHostname(devices []packngo.Device, hostname string) (*packngo.Device, error) {
-	results := make([]packngo.Device, 0)
-	for _, d := range devices {
-		if d.Hostname == hostname {
+func findDeviceByHostname(devices *metalv1.DeviceList, hostname string) (*metalv1.Device, error) {
+	results := make([]metalv1.Device, 0)
+	for _, d := range devices.GetDevices() {
+		if *d.Hostname == hostname {
 			results = append(results, d)
 		}
 	}
