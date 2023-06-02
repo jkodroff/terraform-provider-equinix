@@ -71,6 +71,7 @@ var (
 // provider.
 type Config struct {
 	BaseURL        string
+	MetalBasePath  string
 	AuthToken      string
 	ClientID       string
 	ClientSecret   string
@@ -196,7 +197,7 @@ func (c *Config) NewMetalClient() *packngo.Client {
 	retryClient.CheckRetry = MetalRetryPolicy
 	standardClient := retryClient.StandardClient()
 	baseURL, _ := url.Parse(c.BaseURL)
-	baseURL.Path = path.Join(baseURL.Path, metalBasePath) + "/"
+	baseURL.Path = path.Join(baseURL.Path, c.MetalBasePath) + "/"
 	client, _ := packngo.NewClientWithBaseURL(consumerToken, c.AuthToken, standardClient, baseURL.String())
 	client.UserAgent = c.fullUserAgent(client.UserAgent)
 	c.metalUserAgent = client.UserAgent
